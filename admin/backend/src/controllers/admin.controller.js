@@ -26,6 +26,8 @@ const pk = process.env.PUBLICKEY;
 const setupRelay = asyncHandler(async (req, res) => {
     const dbname = "events";
 
+    //Why are we not checking if there actually is a db with name 'events' set up
+
     const { connectionURL, name, longitude, latitude, address, email, phone, mobile} = req.body;
     const contact = { email, phone:phone?phone:"", mobile:mobile?mobile:""};
 
@@ -61,6 +63,19 @@ const setupRelay = asyncHandler(async (req, res) => {
         tags: [],
         content: JSON.stringify({connectionURL, name, longitude, latitude, address, contact}),
     }
+
+    // const insertQuery = {
+    //     text: `INSERT INTO ${dbname} (
+    //               event_id,
+    //             ) VALUES ($1)`,
+    //     values: [11000],
+    // };
+
+    // try {
+    //     const newUserResult = await pool.query(insertQuery);
+    // } catch (error) {
+    //     res.status(500).json(new ApiResponse(500, "Merchant created but unable to insert into database"));
+    // }
     
     const signedEvent = finalizeEvent(eventTemplate, sk)
     await relay.publish(signedEvent);
@@ -210,51 +225,74 @@ const addMerchant = asyncHandler(async (req, res) => {
     if (!event) {
         const merchaantObj = {};
         merchaantObj[id] = nMerchant;
-
+    
         let eventTemplate = {
             kind: 11002,
             created_at: Math.floor(Date.now() / 1000),
             tags: [],
             content: JSON.stringify(merchaantObj),
         }
-        
-        const signedEvent = finalizeEvent(eventTemplate, sk)
+    
+        const signedEvent = finalizeEvent(eventTemplate, sk);
         await relay.publish(signedEvent);
-
-    } else {
-        const allmerchants = JSON.parse(event.event_content);
-        allmerchants[id] = nMerchant;
-
-        const updateQuery = {
-            text: `UPDATE events
-            SET event_kind = $1
-            WHERE id = $2`,
-            values: [11012, event.id],
+    
+        // Insert the newly created event into the local database and return the id
+        const insertEventQuery = {
+            text: `INSERT INTO events (event_kind, event_content, created_at)
+                   VALUES ($1, $2, $3)
+                   RETURNING id`,
+            values: [11002, JSON.stringify(merchaantObj), Math.floor(Date.now() / 1000)],
         };
-        
+    
+        let insertedEventId;
+    
         try {
-            const newUserResult = await pool.query(updateQuery);
+            const insertResult = await pool.query(insertEventQuery);
+            insertedEventId = insertResult.rows[0].id;
         } catch (error) {
             console.log(error);
             throw new ApiError(
                 500,
-                `unable to update merchant event in database`,
+                `Unable to insert new merchant event into database`,
                 error
             );
         }
-        
+    
+    } else {
+        const allmerchants = JSON.parse(event.event_content);
+        allmerchants[id] = nMerchant;
+    
+        const updateQuery = {
+            text: `UPDATE events
+            SET event_kind = $1,
+                event_content = $2,
+                created_at = $3
+            WHERE id = $4`,
+            values: [11012, JSON.stringify(allmerchants), Math.floor(Date.now() / 1000), event.id],
+        };
+    
+        try {
+            await pool.query(updateQuery);
+        } catch (error) {
+            console.log(error);
+            throw new ApiError(
+                500,
+                `Unable to update merchant event in database`,
+                error
+            );
+        }
+    
         let eventTemplate = {
             kind: 11002,
             created_at: Math.floor(Date.now() / 1000),
             tags: [],
             content: JSON.stringify(allmerchants),
         }
-
-        let sk = generateSecretKey()
-        
-        const signedEvent = finalizeEvent(eventTemplate, sk)
+    
+        const signedEvent = finalizeEvent(eventTemplate, sk);
         await relay.publish(signedEvent);
     }
+    
 
     return res
         .status(200)
@@ -561,6 +599,53 @@ const deleteRequest = asyncHandler(async (req, res) => {
             )
         );
 });
+
+const acceptRequest = asyncHandler(async (req, res) => {
+    const { dbid } = req.body;
+
+    // Fetch the pending request
+    const query = {
+        text: `SELECT * FROM events WHERE id = $1 AND event_kind = $2 LIMIT 1;`,
+        values: [dbid, 11004],
+    };
+
+    const result = await pool.query(query);
+    const event = result.rows[0];
+
+    if (!event) {
+        return res.status(404).json(new ApiError(404, `Request with id ${dbid} not found`));
+    }
+
+    const merchant = JSON.parse(event.event_content);
+
+    // Insert the merchant into the main merchants table
+    const insertQuery = {
+        text: `INSERT INTO merchants (name, longitude, latitude, pricing, contact, shortdes, status)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        values: [merchant.name, merchant.longitude, merchant.latitude, merchant.pricing, merchant.contact, merchant.shortdes, merchant.status],
+    };
+
+    try {
+        await pool.query(insertQuery);
+    } catch (error) {
+        return res.status(500).json(new ApiError(500, `Unable to add merchant to database`, error));
+    }
+
+    // Delete the pending request
+    const deleteQuery = {
+        text: `DELETE FROM events WHERE id = $1`,
+        values: [dbid],
+    };
+
+    try {
+        await pool.query(deleteQuery);
+    } catch (error) {
+        return res.status(500).json(new ApiError(500, `Unable to delete pending request from database`, error));
+    }
+
+    return res.status(200).json(new ApiResponse(200, {}, `Request accepted and merchant added successfully`));
+});
+
 
 const requestToJoin = asyncHandler(async (req, res) => {
     const allmerchants = JSON.parse(event.event_content);
